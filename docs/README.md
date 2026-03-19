@@ -15,4 +15,6 @@ challenge artifact unless you intentionally copy them into a submission record.
 Files:
 
 - `first-five-runs.md`: beginner-friendly experiment plan for your first runs
+- `next-five-runs.md`: batch 2 plan focused on depth, KV heads, and batch size
+- `batch-three-runs.md`: batch 3 plan focused on cap calibration and small-batch promotion
 - `run-log.md`: simple template for recording what you changed and what happened
