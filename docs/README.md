@@ -15,6 +15,7 @@ challenge artifact unless you intentionally copy them into a submission record.
 Files:
 
 - `current-frontier.md`: current best legal run, strongest active branch, what is working, what is not, and the highest-value next moves
+- `track-run-spec.md`: current interpretation of the `10` minute training plus `10` minute evaluation rule and the concrete launch policy for the next `8xH100` runs
 - `first-five-runs.md`: beginner-friendly experiment plan for your first runs
 - `next-five-runs.md`: batch 2 plan focused on depth, KV heads, and batch size
 - `batch-three-runs.md`: batch 3 plan focused on cap calibration and small-batch promotion

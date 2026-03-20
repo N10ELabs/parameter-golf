@@ -119,6 +119,40 @@ torchrun --standalone --nproc_per_node=8 /workspace/parameter-golf/train_gpt.py
 
 This is aligned with the verified `8xH100` record command, but uses the `/workspace/parameter-golf` path convention from the root repo docs.
 
+## Track-Faithful Dense Training Command
+
+Use this when the goal is a leaderboard-style timed training run rather than a
+research run with periodic validation.
+
+```bash
+OMP_NUM_THREADS=1 \
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+NCCL_IB_DISABLE=1 \
+RUN_ID=track_dense_11l_slide64_lzma_p4_8gpu \
+DATA_PATH=/workspace/parameter-golf/data/datasets/fineweb10B_sp1024 \
+TOKENIZER_PATH=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+NUM_LAYERS=11 \
+EVAL_SEQ_LEN=1024 \
+EVAL_STRIDE=64 \
+MAX_WALLCLOCK_SECONDS=600 \
+VAL_LOSS_EVERY=0 \
+INT4_NAME_PATTERNS= \
+MODEL_COMPRESSOR=lzma \
+MODEL_COMPRESS_PRESET=6 \
+QUANT_PICKLE_PROTOCOL=4 \
+QUANT_LOAD_WEIGHTS_ONLY=0 \
+torchrun --standalone --nproc_per_node=8 /workspace/parameter-golf/train_gpt.py
+```
+
+Notes:
+
+- This is intended to spend the training budget on learning, not on mid-run
+  validation.
+- Follow it with a separate export/eval run from the saved checkpoint.
+- If you want richer curve monitoring, that is a research run, not a strict
+  leaderboard-faithful timing rehearsal.
+
 ## Readiness Check Once The Pod Is Live
 
 These are the only checks you need before the first real run:
@@ -143,3 +177,5 @@ Expected outcome:
 
 - The root [README.md](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/README.md) only documents the `1xH100` path directly, so this file fills in the missing `8xH100` operational details for this fork.
 - Keep the actual training launch separate from bootstrap. That makes it easier to stop after setup and avoid accidental spend.
+- For the current timing interpretation and what the next serious runs should
+  optimize for, see [track-run-spec.md](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/docs/track-run-spec.md).

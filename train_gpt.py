@@ -41,10 +41,12 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    strict_wallclock = bool(int(os.environ.get("STRICT_WALLCLOCK", "0")))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     init_model_path = os.environ.get("INIT_MODEL_PATH", "")
     disable_model_compile = bool(int(os.environ.get("DISABLE_MODEL_COMPILE", "0")))
     skip_prequant_eval_zero_iters = bool(int(os.environ.get("SKIP_PREQUANT_EVAL_ZERO_ITERS", "0")))
+    skip_post_train_eval = bool(int(os.environ.get("SKIP_POST_TRAIN_EVAL", "0")))
     qat_int4 = bool(int(os.environ.get("QAT_INT4", "0")))
     qat_only_target_params = bool(int(os.environ.get("QAT_ONLY_TARGET_PARAMS", "0")))
 
@@ -828,6 +830,7 @@ def main() -> None:
     global zeropower_via_newtonschulz5
 
     args = Hyperparameters()
+    run_wallclock_start = time.perf_counter()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
@@ -1004,7 +1007,9 @@ def main() -> None:
     )
     log0(f"seed:{args.seed}")
     log0(f"model_compile:{not args.disable_model_compile}")
+    log0(f"strict_wallclock:{args.strict_wallclock}")
     log0(f"skip_prequant_eval_zero_iters:{args.skip_prequant_eval_zero_iters}")
+    log0(f"skip_post_train_eval:{args.skip_post_train_eval}")
     if args.init_model_path:
         log0(f"init_model_path:{args.init_model_path}")
     if INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS:
@@ -1026,6 +1031,9 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+
+    def wallclock_elapsed_ms() -> float:
+        return 1000.0 * (time.perf_counter() - run_wallclock_start)
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1073,7 +1081,9 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = ((not args.skip_post_train_eval) and last_step) or (
+            args.val_loss_every > 0 and step % args.val_loss_every == 0
+        )
         if args.skip_prequant_eval_zero_iters and args.iterations == 0 and step == 0:
             should_validate = False
         if should_validate:
@@ -1102,11 +1112,11 @@ def main() -> None:
             if stop_after_step is not None and step < args.iterations:
                 log0(
                     f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
+                    f"wallclock_elapsed:{wallclock_elapsed_ms():.0f}ms step:{step}/{args.iterations}"
                 )
             break
 
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        elapsed_ms = wallclock_elapsed_ms() if args.strict_wallclock else training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1150,10 +1160,12 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+                f"train_time:{approx_training_time_ms:.0f}ms wallclock_elapsed:{wallclock_elapsed_ms():.0f}ms "
+                f"step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
-        reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
+        reached_cap_elapsed_ms = wallclock_elapsed_ms() if args.strict_wallclock else approx_training_time_ms
+        reached_cap = max_wallclock_ms is not None and reached_cap_elapsed_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
@@ -1165,6 +1177,7 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    log0(f"training_phase_wallclock_elapsed:{wallclock_elapsed_ms():.0f}ms")
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1173,6 +1186,14 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+
+    if distributed:
+        dist.barrier()
+    if args.skip_post_train_eval:
+        log0(f"training_only_exit wallclock_elapsed:{wallclock_elapsed_ms():.0f}ms")
+        if distributed:
+            dist.destroy_process_group()
+        return
 
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()

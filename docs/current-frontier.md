@@ -21,22 +21,25 @@ submission-script promotion.
 
 ### Strongest active training branch
 
-- `run101_10l_slide64_fp16emb_latek_muwd`
-- `NUM_LAYERS=10`
+- `run102_11l_dense_slide64_lzma_p4_8xh100_20260320`
+- dense `11`-layer family
 - `EVAL_SEQ_LEN=1024`
 - `EVAL_STRIDE=64`
-- `TIED_EMBED_LR=0.1`
-- `MUON_WEIGHT_DECAY=0.02`
-- `INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS=tok_emb.weight,blocks.8.attn.c_k.weight,blocks.9.attn.c_k.weight`
+- `INT4_NAME_PATTERNS=`
+- `MODEL_COMPRESSOR=lzma`
+- `MODEL_COMPRESS_PRESET=6`
+- `QUANT_PICKLE_PROTOCOL=4`
+- `QUANT_LOAD_WEIGHTS_ONLY=0`
 
 Current signal:
 
-- model params: `18,897,488`
-- reached `1400/1400` training steps
-- step average stayed around `445-501 ms`
-- final export/eval is still pending
+- model params: `20,734,552`
+- active `8xH100` timed run
+- dense exporter and `lzma+p4` packaging are enabled
+- periodic validation is still on, so it is a good research run but not a
+  strict leaderboard-faithful training rehearsal
 
-This is the highest-value model-side branch still alive.
+This is now the highest-value active branch.
 
 ## What Is Working
 
@@ -71,13 +74,24 @@ The infrastructure is now in place for:
 
 Those are now usable levers, not just ideas.
 
-### 5. The `10`-layer branch is viable
+### 5. The competition timing rule is now clear
 
-The first corrected `10`-layer upstream-style run is not obviously too slow,
-too large, or unstable on `1xH100`.
+For leaderboard attempts, we should think in two separate budgets:
 
-That matters because a smaller architecture is what makes FP16 tied embedding
-and late-layer FP16 passthrough realistically affordable.
+- `10` minutes for training
+- `10` minutes for evaluation
+
+That means timed training runs should not waste much of the training budget on
+periodic validation. Evaluation can be optimized separately.
+
+### 6. The dense `11`-layer family is the safest live branch
+
+The strongest near-frontier results are still closest to the `run92` / `run95`
+/ `run97` line:
+
+- dense export
+- `1024/64` sliding eval
+- `lzma+p4` packaging
 
 ## What Is Not Working
 
@@ -90,55 +104,62 @@ It was a good learning branch, but not the best current leaderboard branch.
 That may still matter later with a different training recipe, but for the
 current checkpoints it lost.
 
-### 3. Two late `c_k` FP16 tensors are too expensive on `run28`
+### 3. The `10`-layer `run101` branch is no longer the lead bet
 
-`run99` made this clear:
+It did not hold up under export controls:
 
-- serialized model int8+lzma: `16,142,248`
-- total submission size: `16,174,242`
+- mixed-export result was poor
+- dense-control result was worse
+- it is not the branch we should spend the next serious timed runs on
 
-So the current `run28` branch cannot afford that export recipe.
+### 4. Periodic validation during timed training is not leaderboard-faithful
 
-### 4. Pure export tweaking is now lower ROI than the new `10`-layer training branch
+Those runs are still useful for research, but they are not the cleanest
+interpretation of the competition rule once we separate training and evaluation
+budgets.
 
-We already got the big eval-policy win. The next meaningful score jump is more
-likely to come from a new training recipe than from one more export-only sweep.
+### 5. Pure export tweaking is not the main `8xH100` training objective
+
+Export policy still matters, but the next timed pod runs should primarily spend
+their budget on training, not on monitoring or promotion-only work.
 
 ## Strongest Approach To Keep Pushing
 
 If we want one sentence:
 
-- **Current best practical path is dense + `lzma+p4` + `1024/64` sliding eval, while we test whether the upstream-style `10`-layer branch can beat it.**
+- **Current best practical path is dense `11`-layer training close to the `run95/run97` family, using the full `10`-minute training budget, then a separate `1024/64` slide64 dense `lzma+p4` evaluation pass.**
 
 If we want the execution order:
 
 1. Keep `run97` as the banked legal baseline.
-2. Finish `run101` and inspect final score, total bytes, and quantization gap.
-3. If `run101` is competitive, stay on the `10`-layer branch.
-4. If `run101` disappoints, fall back to the `run97` / `run95` family and do a
-   submission-specific promotion of the best screened slide64 result.
+2. Use the dense `11`-layer family for the next serious `8xH100` timed runs.
+3. Treat timed training and evaluation as separate budgets.
+4. Only return to the `10`-layer branch if a new model-side idea specifically
+   addresses its export gap.
 
 ## Next Experiments
 
-### If `run101` is promising
+### Track-faithful timed training run
 
-Run one of these next:
+1. Dense `11`-layer family
+2. `MAX_WALLCLOCK_SECONDS=600`
+3. `VAL_LOSS_EVERY=0` or very sparse
+4. `INT4_NAME_PATTERNS=`
+5. `MODEL_COMPRESSOR=lzma`
+6. `MODEL_COMPRESS_PRESET=6`
+7. `QUANT_PICKLE_PROTOCOL=4`
+8. `QUANT_LOAD_WEIGHTS_ONLY=0`
 
-1. Lower-LR / longer-warmdown variant on the same `10`-layer recipe.
-2. Slightly cheaper sensitive-tensor export:
-   - keep `tok_emb.weight` in FP16
-   - keep only one late `c_k` in FP16 if total bytes are tight
-3. Longer-context follow-up only if the `10`-layer branch looks robust enough
-   to justify it.
+### Separate evaluation/promotion run
 
-### If `run101` is not promising
+1. Load the saved checkpoint in a separate pass
+2. Use `1024/64` sliding-window eval
+3. Keep the dense exporter
+4. Measure final roundtrip score and artifact bytes under the separate eval
+   budget
 
-Do this instead:
-
-1. Treat `run97` as the dense legal control.
-2. Revisit the `run95` screened frontier.
-3. Use submission-specific code golf to see whether the best `run92 + slide64`
-   promotion can be made legal.
+For the explicit timing interpretation and run policy, see
+[track-run-spec.md](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/docs/track-run-spec.md).
 
 ## `8xH100` Reality
 
@@ -146,15 +167,14 @@ It is fine if `8xH100` is unavailable tonight.
 
 What is blocked:
 
-- true leaderboard-style validation under the official wallclock regime
-- confirming how much extra optimization the best recipe gets from distributed
-  throughput
+- strict leaderboard-faithful timing still needs a cleaner separation between
+  training and evaluation than the current research launch style gives us
 
 What is not blocked:
 
-- pruning bad recipes on `1xH100`
-- validating export/compression policy
-- deciding which branch deserves the first `8xH100` attempt
+- deciding which family deserves the next serious `8xH100` attempts
+- defining the next track-faithful training run spec
+- separating training and evaluation policy
 
 So the current goal should be:
 
@@ -165,6 +185,6 @@ So the current goal should be:
 
 - Best legal run right now: `run97` at `1.32149156`
 - Best screened score right now: `run95` at `1.32008711`
-- Strongest active branch right now: `run101` `10`-layer upstream-style recipe
-- Best next move right now: finish `run101`, then either stay on that branch or
-  fall back to a tighter `run95/run97` promotion path
+- Strongest active branch right now: dense `11`-layer `run95/run97` family
+- Best next move right now: use the full `10`-minute training budget on that
+  dense family, then evaluate separately
