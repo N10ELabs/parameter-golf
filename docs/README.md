@@ -14,8 +14,15 @@ challenge artifact unless you intentionally copy them into a submission record.
 
 Files:
 
-- `current-frontier.md`: current best legal run, strongest active branch, what is working, what is not, and the highest-value next moves
+- `current-frontier.md`: current best legal run, best screened score, the proved `8xH100` timing workflow, what is working, what is not, and the highest-value next moves
 - `track-run-spec.md`: current interpretation of the `10` minute training plus `10` minute evaluation rule and the concrete launch policy for the next `8xH100` runs
+- `8xh100-pod-setup.md`: practical `8xH100` RunPod bootstrap, strict training command, and separate evaluation command
+- `batch-eighteen-runs.md`: detailed writeup of the 2026-03-20 morning `8xH100` pod session, including `run101`, `run102`, the strict-timing trainer patch, and the `run106` to `run109` split-run results
+- `batch-nineteen-runs.md`: batch 19 plan focused on measuring the real byte and score trade of FP16 tied embeddings and identifying the gentlest payer tensors
+- `batch-twenty-runs.md`: batch 20 plan focused on adding and testing an intermediate-precision exporter, likely grouped `int6`
+- `batch-twenty-one-runs.md`: batch 21 plan focused on compression-aware schedule sweeps judged by the final exporter, not just dense pre-quant loss
+- `batch-twenty-two-runs.md`: batch 22 plan focused on reinvesting recovered compression headroom into moderate context gains
+- `batch-twenty-three-runs.md`: batch 23 plan focused on the strict competition-faithful `8xH100` promotion attempt
 - `first-five-runs.md`: beginner-friendly experiment plan for your first runs
 - `next-five-runs.md`: batch 2 plan focused on depth, KV heads, and batch size
 - `batch-three-runs.md`: batch 3 plan focused on cap calibration and small-batch promotion

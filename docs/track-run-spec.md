@@ -15,29 +15,105 @@ That means:
 
 - training should spend its budget on actual learning
 - evaluation can be optimized separately
-- periodic validation during the timed training run is not free in the spirit
-  of the rule, even if the current trainer does not count it cleanly
+- periodic validation during the timed training run counts against the training
+  wallclock in practice, even if older local scripts did not measure it
+  correctly
 
-## Implications For This Fork
+## Implemented Strict Workflow
 
-### 1. Research runs and track-faithful runs are different
+The morning `8xH100` session added the missing controls to
+[train_gpt.py](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/train_gpt.py):
 
-Research runs can keep `VAL_LOSS_EVERY=200` or similar if the extra signal is
-worth the cost.
+### `STRICT_WALLCLOCK=1`
 
-Track-faithful runs should not spend much of the training window on periodic
-validation.
+- training stops against true elapsed wallclock
+- the timer starts before warmup
+- this is the right mode for strict training-budget runs
 
-### 2. `MAX_WALLCLOCK_SECONDS=600` is not enough by itself
+### `SKIP_POST_TRAIN_EVAL=1`
 
-In the current `train_gpt.py`, the stop condition is driven by accumulated
-training-time segments, not a clean end-to-end elapsed-wallclock measurement.
+- save `final_model.pt`
+- exit before quantization and final eval
+- use this for the timed training phase only
 
-So a run can respect the current internal cap while still taking more than
-`10` real minutes once warmup, periodic validation, and final export/eval are
-included.
+### No forced last-step validation in training-only mode
 
-### 3. Separate training and evaluation on purpose
+This bug mattered in practice. The first strict attempt still overran because
+training-only mode was validating at the final step. The clean fix was to skip
+that validation path when `SKIP_POST_TRAIN_EVAL=1`.
+
+## Research Runs Versus Track Runs
+
+### Research runs
+
+Use these when you want curve visibility:
+
+- `VAL_LOSS_EVERY=200` or similar
+- periodic validation on
+- not a strict leaderboard-faithful rehearsal
+
+### Track-faithful runs
+
+Use these when the goal is a real competition-valid attempt:
+
+- `VAL_LOSS_EVERY=0`
+- timed training only
+- separate export/eval afterward
+
+## Measured `8xH100` Timing Reality
+
+### `run103` showed why `600` internal seconds was unsafe
+
+First strict attempt:
+
+- `STRICT_WALLCLOCK=1`
+- `MAX_WALLCLOCK_SECONDS=600`
+- `VAL_LOSS_EVERY=0`
+- `SKIP_POST_TRAIN_EVAL=1`
+
+Observed timing:
+
+- internal `training_phase_wallclock_elapsed: 644757ms`
+- external wrapper wallclock: `656s`
+
+Why it failed:
+
+- training-only mode still triggered a final validation
+- `torchrun` startup also adds real wallclock before `main()` begins timing
+
+### `run106` established the practical safe cap
+
+Clean strict run:
+
+- `STRICT_WALLCLOCK=1`
+- `MAX_WALLCLOCK_SECONDS=588`
+- `VAL_LOSS_EVERY=0`
+- `SKIP_POST_TRAIN_EVAL=1`
+
+Observed timing:
+
+- internal `training_only_exit wallclock_elapsed: 588125ms`
+- external wrapper wallclock: `598s`
+
+Practical rule:
+
+- with the current `torchrun --standalone --nproc_per_node=8` launch pattern,
+  use `MAX_WALLCLOCK_SECONDS=588` for strict training attempts
+
+### Separate evaluation easily fit the eval budget
+
+From the `run106` checkpoint:
+
+- `run107` dense eval: `108s`
+- `run108` legal mixed-`int4` eval: `107s`
+- `run109` legal mixed-`int4` plus float-passthrough eval: `106s`
+
+So the split workflow is real:
+
+- under `10` minutes to train
+- under `10` minutes to evaluate
+
+## Concrete Run Policy
 
 The clean workflow is:
 
@@ -47,16 +123,27 @@ The clean workflow is:
 
 ## Current Track-Focused Direction
 
-The safest live family is now the dense `11`-layer line closest to
-`run95` / `run97`, not the `10`-layer `run101` branch.
+The best banked baseline is still:
 
-Current policy for that family:
+- `run97_min_upstream_slide64_from_run28`
+- `final_int8_zlib_roundtrip_exact val_bpb: 1.32149156`
+
+The most important new infrastructure result is:
+
+- `run106_track_dense11_train_strict588_clean_8xh100_20260320d`
+
+That run proved the timing workflow, but not the modeling branch. The next pod
+attempt should reuse the strict workflow while choosing a branch for likely
+legal export quality, not just training-time loss.
+
+Current default policy for strict runs:
 
 - dense exporter: `INT4_NAME_PATTERNS=`
 - packaging: `MODEL_COMPRESSOR=lzma`, `MODEL_COMPRESS_PRESET=6`,
   `QUANT_PICKLE_PROTOCOL=4`, `QUANT_LOAD_WEIGHTS_ONLY=0`
 - evaluation: `EVAL_SEQ_LEN=1024`, `EVAL_STRIDE=64`
-- training focus: use the full `10`-minute training budget on `8xH100`
+- training focus: use almost the full `10`-minute training budget on `8xH100`
+  while leaving wrapper headroom
 
 ## Next Runs
 
@@ -65,8 +152,10 @@ Current policy for that family:
 Use this when the goal is a real leaderboard-style training attempt:
 
 - dense `11`-layer family
-- `MAX_WALLCLOCK_SECONDS=600`
-- `VAL_LOSS_EVERY=0` or very sparse
+- `STRICT_WALLCLOCK=1`
+- `MAX_WALLCLOCK_SECONDS=588`
+- `VAL_LOSS_EVERY=0`
+- `SKIP_POST_TRAIN_EVAL=1`
 - no mixed-`int4` exporter
 - save the checkpoint and stop
 
@@ -77,6 +166,9 @@ The goal is to spend the training budget on model improvement, not monitoring.
 After a timed training run finishes:
 
 - load the saved checkpoint with `INIT_MODEL_PATH=...`
+- use `ITERATIONS=0`
+- use `WARMUP_STEPS=0`
+- use `SKIP_PREQUANT_EVAL_ZERO_ITERS=1`
 - use export-only or near-export-only settings
 - run `1024/64` sliding-window eval
 - measure final roundtrip score and artifact bytes under the separate eval
@@ -95,6 +187,8 @@ These are still useful, but should be labeled clearly as research runs:
 If the question is “what should the next serious runs optimize for,” the answer
 is:
 
-- **full `10` minutes for training**
+- **a real `598s`-or-less training process, which means about `588s` internal
+  wallclock**
 - **separate `10` minutes for evaluation**
-- **dense `11`-layer `run95/run97` family first**
+- **reuse the strict workflow from `run106`, but only on a branch with a
+  plausible legal roundtrip path**

@@ -135,8 +135,10 @@ VOCAB_SIZE=1024 \
 NUM_LAYERS=11 \
 EVAL_SEQ_LEN=1024 \
 EVAL_STRIDE=64 \
-MAX_WALLCLOCK_SECONDS=600 \
+STRICT_WALLCLOCK=1 \
+MAX_WALLCLOCK_SECONDS=588 \
 VAL_LOSS_EVERY=0 \
+SKIP_POST_TRAIN_EVAL=1 \
 INT4_NAME_PATTERNS= \
 MODEL_COMPRESSOR=lzma \
 MODEL_COMPRESS_PRESET=6 \
@@ -149,9 +151,44 @@ Notes:
 
 - This is intended to spend the training budget on learning, not on mid-run
   validation.
+- `588` rather than `600` is deliberate. On the measured morning `8xH100`
+  runs, `torchrun` startup consumed about `10-11` seconds of real wallclock
+  before the trainer's internal timer started.
 - Follow it with a separate export/eval run from the saved checkpoint.
 - If you want richer curve monitoring, that is a research run, not a strict
   leaderboard-faithful timing rehearsal.
+
+## Track-Faithful Separate Evaluation Command
+
+Use this after the strict training run finishes and the checkpoint is saved.
+
+```bash
+OMP_NUM_THREADS=1 \
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+NCCL_IB_DISABLE=1 \
+RUN_ID=track_dense_11l_eval_8gpu \
+DATA_PATH=/workspace/parameter-golf/data/datasets/fineweb10B_sp1024 \
+TOKENIZER_PATH=/workspace/parameter-golf/data/tokenizers/fineweb_1024_bpe.model \
+VOCAB_SIZE=1024 \
+INIT_MODEL_PATH=/workspace/parameter-golf/runs/<train-run-id>/final_model.pt \
+ITERATIONS=0 \
+WARMUP_STEPS=0 \
+DISABLE_MODEL_COMPILE=1 \
+SKIP_PREQUANT_EVAL_ZERO_ITERS=1 \
+NUM_LAYERS=11 \
+EVAL_SEQ_LEN=1024 \
+EVAL_STRIDE=64 \
+INT4_NAME_PATTERNS= \
+MODEL_COMPRESSOR=lzma \
+MODEL_COMPRESS_PRESET=6 \
+QUANT_PICKLE_PROTOCOL=4 \
+QUANT_LOAD_WEIGHTS_ONLY=0 \
+torchrun --standalone --nproc_per_node=8 /workspace/parameter-golf/train_gpt.py
+```
+
+This keeps the evaluation budget separate from training and matches the
+competition interpretation used in
+[track-run-spec.md](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/docs/track-run-spec.md).
 
 ## Readiness Check Once The Pod Is Live
 

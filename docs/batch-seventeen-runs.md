@@ -81,14 +81,14 @@ ideas from [upstream-scan-2026-03-19.md](/Users/anthonymarti/Desktop/N10E%20LABS
 ### run101_10l_slide64_fp16emb_latek_muwd
 
 - Change: exact rerun of `run100` after fixing the Muon weight-decay bug
-- Status: in progress
-- Early signal:
-  - `model_params: 18897488`
-  - `step:100/1400 train_loss:3.3985`
-  - `step_avg: 498.97ms`
-- Takeaway: this `10`-layer branch is operationally viable on `1xH100`, is
-  smaller than the `11`-layer family, and is now the highest-value training
-  branch to continue.
+- Status: later completed on `8xH100`; follow-up is documented in
+  [batch-eighteen-runs.md](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/docs/batch-eighteen-runs.md)
+- Follow-up result:
+  - pre-quant `val_bpb: 1.3321`
+  - mixed-export final exact roundtrip `val_bpb: 1.42602122`
+  - dense-control final exact roundtrip `val_bpb: 2.16189055`
+- Takeaway: this branch was operationally viable but did not survive export
+  controls well enough to remain the lead bet.
 
 ## Current Frontier
 
@@ -98,13 +98,15 @@ ideas from [upstream-scan-2026-03-19.md](/Users/anthonymarti/Desktop/N10E%20LABS
 - Best legal run: `run97_min_upstream_slide64_from_run28`
   - `1.32149156`
   - `15,908,380` total bytes
-- Active training branch: `run101_10l_slide64_fp16emb_latek_muwd`
+- Follow-up batch: see
+  [batch-eighteen-runs.md](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/docs/batch-eighteen-runs.md)
 
 ## Next Move
 
-1. Let `run101` reach a meaningful checkpoint or completion.
-2. If `run101` is competitive, run one schedule follow-up:
-   - lower-LR / longer-warmdown variant, or
-   - longer-context variant
-3. Only return to code golf for the `run92` family if we decide the `10`-layer
-   branch is not outpacing the improved legal `run97` baseline.
+What actually happened next is documented in
+[batch-eighteen-runs.md](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/docs/batch-eighteen-runs.md):
+
+1. `run101` completed on `8xH100` and was rejected as the lead branch.
+2. The dense `11`-layer family was retested on `8xH100`.
+3. The fork gained a real strict `10` minute training plus `10` minute
+   evaluation workflow.

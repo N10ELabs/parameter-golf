@@ -269,15 +269,94 @@ Use this file as a lightweight experiment journal.
 | run98_min_upstream_slide64_ck9fp16_from_run28 | One late `c_k` FP16 passthrough may improve the legal sliding-eval frontier | `run28` checkpoint plus `INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS=blocks.9.attn.c_k.weight` | n/a | n/a | n/a | n/a | n/a | partial | n/a | n/a | Stopped early to avoid paying the old double-eval cost |
 | run99_min_upstream_slide64_ck9ck10_fast_from_run28 | Two late `c_k` FP16 passthrough tensors may recover more score under the fast export-only path | `run28` checkpoint plus `blocks.9/10.attn.c_k.weight` in FP16, compile off, skip pre-quant eval | n/a | skipped | skipped | n/a | n/a | 16142248 | n/a | 80 | Over total cap at `16,174,242` bytes, stopped early |
 | run100_10l_slide64_fp16emb_latek_muwd | First upstream-style `10`-layer branch may buy quality per byte with FP16-sensitive export | `NUM_LAYERS=10`, `TIED_EMBED_LR=0.1`, `MUON_WEIGHT_DECAY=0.02`, slide64 eval, FP16 embed + late `c_k` export | n/a | n/a | n/a | n/a | n/a | n/a | n/a | Failed on first attempt due Muon weight-decay implementation bug |
-| run101_10l_slide64_fp16emb_latek_muwd | The corrected `10`-layer branch should be operationally viable and competitive enough to continue | same as `run100`, after Muon-WD fix | partial | n/a | n/a | n/a | n/a | n/a | 498.97 at step 100 | ~12967 | In progress; early training signal is healthy |
+| run101_10l_slide64_fp16emb_latek_muwd | The corrected `10`-layer branch should be operationally viable and competitive enough to continue | same as `run100`, after Muon-WD fix | n/a | 2.2493 | 1.3321 | 2.40777710 | 1.42602122 | 10882226 | 49.33 | 11706 | Completed later on `8xH100`; export gap killed the branch |
 
 ## Batch 17 Summary
 
 - `run95` proved that sliding-window eval is the highest-ROI upstream port for this fork so far, and `run97` turned that into a legal promoted run at `1.32149156`.
 - The `run28` family does not have enough artifact budget for two FP16 late-`c_k` tensors, so the export-side branch is mostly exhausted.
-- The next serious path is the new `10`-layer upstream-style training branch in `run101`, which is smaller than the `11`-layer family and training at about `499 ms/step` on `1xH100`.
+- The later `8xH100` follow-up on `run101` showed that the `10`-layer branch was operationally fine but not competitive after export, so it did not replace the dense `11`-layer line.
 - `run20_depth12_926_codecut` proved that one more step still fits, but not every extra step helps; it stayed legal and still lost to `run19` on score.
 - The current best base is `NUM_LAYERS=12`, `ITERATIONS=925`, with the trimmed `train_gpt.py` and hybrid serializer.
+
+## Batch 18
+
+| Run | Hypothesis | Change | Final train_loss | Final val_loss | Final val_bpb | Final roundtrip val_loss | Final roundtrip val_bpb | Int8+zlib bytes | Step avg ms | Peak memory MiB | Result |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| run101_10l_slide64_fp16emb_latek_muwd_8xh100_20260320 | The upstream-style `10`-layer branch might buy enough quality per byte to justify the first `8xH100` push | `NUM_LAYERS=10`, `TIED_EMBED_LR=0.1`, `MUON_WEIGHT_DECAY=0.02`, `1024/64` eval, FP16 embed plus late `c_k` passthrough | n/a | 2.2493 | 1.3321 | 2.40777710 | 1.42602122 | 10882226 | 49.33 | 11706 | Training was healthy, but the quantization gap was too large |
+| run101_dense_export_control_8xh100_20260320 | Dense export-only control should tell us whether `run101` merely picked the wrong exporter | saved `run101` checkpoint, `ITERATIONS=0`, `INT4_NAME_PATTERNS=` | n/a | skipped | skipped | 3.65026163 | 2.16189055 | 16094636 | n/a | n/a | Dense control was even worse and over the `16 MB` cap |
+| run102_11l_dense_slide64_lzma_p4_8xh100_20260320 | A safer dense `11`-layer family should use the pod budget more sensibly than `run101` | dense `11`-layer family, `1024/64`, `lzma+p4`, periodic validation still enabled | partial | n/a | 1.2198 at step 5400 | n/a | n/a | n/a | ~65.62 by step 5600 | n/a | Strong research signal, but not a strict leaderboard-faithful run |
+| run103_track_dense11_train_strictwall_8xh100_20260320 | First strict split run should prove real `10` minute training once wallclock is measured correctly | `STRICT_WALLCLOCK=1`, `MAX_WALLCLOCK_SECONDS=600`, `VAL_LOSS_EVERY=0`, `SKIP_POST_TRAIN_EVAL=1` | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | Overran because training-only mode still forced a final validation |
+| run106_track_dense11_train_strict588_clean_8xh100_20260320d | Reducing the internal cap should keep the full process under `10` real minutes | same as `run103`, but `MAX_WALLCLOCK_SECONDS=588` after fixing the last-step-validation bug | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | First clean competition-faithful training run; external wallclock `598s` |
+| run107_eval_dense_slide64_from_run106_8xh100_20260320d | Dense export from the strict timed checkpoint might still be promotable | export-only eval from `run106`, `INT4_NAME_PATTERNS=` | n/a | skipped | skipped | 3.71032873 | 2.19746567 | 19260692 | n/a | n/a | Eval time was legal, but artifact bytes and score were both bad |
+| run108_eval_mixedint4_from_run106_8xh100_20260320d | Default mixed-`int4` might legalize the strict timed checkpoint | export-only eval from `run106`, default mixed-`int4` | n/a | skipped | skipped | 4.08271236 | 2.41801223 | 13188288 | n/a | n/a | Fully legal on time and bytes, but quality collapsed |
+| run109_eval_mixedint4_tokemb_ck_from_run106_8xh100_20260320d | Selective float passthrough might recover some of the mixed-`int4` loss | export-only eval from `run106`, mixed-`int4` plus `tok_emb` and late `c_k` float passthrough | n/a | skipped | skipped | 4.05366229 | 2.40080714 | 13700420 | n/a | n/a | Best legal artifact from the timed checkpoint, still far from frontier |
+
+### run101_10l_slide64_fp16emb_latek_muwd_8xh100_20260320
+
+- Run ID: `run101_10l_slide64_fp16emb_latek_muwd_8xh100_20260320`
+- Command family: upstream-style `10`-layer branch on `8xH100`
+- What I expected: the smaller branch might preserve enough quality to justify more serious multi-GPU budget
+- What happened: pre-quant came in at `1.3321`, but final exact roundtrip fell to `1.42602122`
+- What I learned: the branch was healthy to train, but not healthy to export
+
+### run101_dense_export_control_8xh100_20260320
+
+- Run ID: `run101_dense_export_control_8xh100_20260320`
+- Command family: dense export-only control from the saved `run101` checkpoint
+- What I expected: this would tell us whether the failure was caused mainly by the mixed-`int4` default path
+- What happened: final exact roundtrip collapsed to `2.16189055` and total submission size rose above the cap
+- What I learned: `run101` itself was the problem, not just the exporter choice
+
+### run102_11l_dense_slide64_lzma_p4_8xh100_20260320
+
+- Run ID: `run102_11l_dense_slide64_lzma_p4_8xh100_20260320`
+- Command family: safer dense `11`-layer `8xH100` research run
+- What I expected: this would give better signal than `run101` while we clarified the timing rule
+- What happened: validation improved from `1.4070` at step `600` to `1.2198` at step `5400`, but periodic validation made the run unsuitable as a clean competition rehearsal
+- What I learned: the model family was healthier than `run101`, but the trainer still needed a real wallclock split mode
+
+### run103_track_dense11_train_strictwall_8xh100_20260320
+
+- Run ID: `run103_track_dense11_train_strictwall_8xh100_20260320`
+- Command family: first strict training-only attempt with true wallclock
+- What I expected: this would be the first clean `10` minute training run
+- What happened: the process still ran too long because training-only mode accidentally forced a final validation; internal timing reached `644757ms` and external wallclock reached `656s`
+- What I learned: the training-only path also had to disable last-step validation, and wrapper overhead needed headroom
+
+### run104 and run105
+
+- Status: intentionally aborted cleanup attempts while fixing the strict-timing process flow
+- What I learned: treat them as operational cleanup, not modeling evidence
+
+### run106_track_dense11_train_strict588_clean_8xh100_20260320d
+
+- Run ID: `run106_track_dense11_train_strict588_clean_8xh100_20260320d`
+- Command family: corrected strict training-only run with wrapper headroom
+- What I expected: this should finally produce a competition-faithful training process
+- What happened: internal training-only exit landed at `588125ms`, external wallclock landed at `598s`, and the checkpoint was saved successfully
+- What I learned: the split workflow now works for real, and `588` internal seconds is the safe practical cap with the current launcher
+
+### run107 to run109
+
+- Run IDs:
+  - `run107_eval_dense_slide64_from_run106_8xh100_20260320d`
+  - `run108_eval_mixedint4_from_run106_8xh100_20260320d`
+  - `run109_eval_mixedint4_tokemb_ck_from_run106_8xh100_20260320d`
+- Command family: separate export/eval runs from the strict `run106` checkpoint
+- What I expected: one of the export policies might produce a competitive legal artifact
+- What happened:
+  - dense eval was time-valid but byte-illegal and still poor on score
+  - mixed-`int4` evals were legal on time and bytes but catastrophically worse on score
+- What I learned: `run106` was an infrastructure success, not a new frontier checkpoint
+
+## Batch 18 Summary
+
+- The session successfully turned the fork into a real split-budget `8xH100` workflow: training under `10` real minutes and evaluation under `10` real minutes both now work.
+- The safe strict-training cap with the current `torchrun` launch pattern is about `588` internal seconds, not `600`, because startup overhead costs real wallclock before `main()` starts timing.
+- `run101` is no longer a serious frontier candidate. It was operationally healthy but failed badly on both mixed-export and dense-control paths.
+- `run106` proved that a dense `11`-layer family can train within the competition rule, but its checkpoint exported terribly: dense was byte-illegal and mixed-`int4` destroyed quality.
+- The best legal result in the repo is still `run97` at `1.32149156`.
 
 ## Batch 6
 
