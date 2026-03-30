@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import inspect
 import glob
 import io
 import lzma
@@ -20,6 +22,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    SDP_ATTENTION_SUPPORTS_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+except (TypeError, ValueError):
+    SDP_ATTENTION_SUPPORTS_GQA = False
 
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -48,6 +55,7 @@ class Hyperparameters:
     skip_prequant_eval_zero_iters = bool(int(os.environ.get("SKIP_PREQUANT_EVAL_ZERO_ITERS", "0")))
     skip_post_train_eval = bool(int(os.environ.get("SKIP_POST_TRAIN_EVAL", "0")))
     qat_int4 = bool(int(os.environ.get("QAT_INT4", "0")))
+    qat_int6 = bool(int(os.environ.get("QAT_INT6", "0")))
     qat_only_target_params = bool(int(os.environ.get("QAT_ONLY_TARGET_PARAMS", "0")))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -331,23 +339,104 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_ROTATE_NAME_PATTERNS = tuple(
+    pattern for pattern in os.environ.get("INT8_ROTATE_NAME_PATTERNS", "").split(",") if pattern
+)
 INT4_CLIP_PERCENTILE = float(os.environ.get("INT4_CLIP_PERCENTILE", str(INT8_CLIP_PERCENTILE)))
 INT4_CLIP_Q = INT4_CLIP_PERCENTILE / 100.0
 INT4_GROUP_SIZE = int(os.environ.get("INT4_GROUP_SIZE", "0"))
 INT4_NAME_PATTERNS = tuple(
     pattern for pattern in os.environ.get("INT4_NAME_PATTERNS", "mlp.fc.weight,mlp.proj.weight").split(",") if pattern
 )
+INT6_CLIP_PERCENTILE = float(os.environ.get("INT6_CLIP_PERCENTILE", str(INT8_CLIP_PERCENTILE)))
+INT6_CLIP_Q = INT6_CLIP_PERCENTILE / 100.0
+INT6_GROUP_SIZE = int(os.environ.get("INT6_GROUP_SIZE", "0"))
+INT6_NAME_PATTERNS = tuple(
+    pattern for pattern in os.environ.get("INT6_NAME_PATTERNS", "").split(",") if pattern
+)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+def matches_name_patterns(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
 def keep_float_tensor(name: str, t: Tensor) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+    if matches_name_patterns(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     return t if t.dtype == INT8_KEEP_FLOAT_STORE_DTYPE else t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
 
+def next_power_of_two(n: int) -> int:
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
+def fwht_last_dim(x: Tensor) -> Tensor:
+    if x.ndim != 2:
+        raise ValueError("fwht_last_dim expects a 2D tensor")
+    n = x.shape[1]
+    if n & (n - 1):
+        raise ValueError(f"fwht_last_dim requires power-of-two width, got {n}")
+    y = x.contiguous()
+    h = 1
+    while h < n:
+        y = y.view(-1, n // (2 * h), 2, h)
+        a = y[:, :, 0, :].clone()
+        b = y[:, :, 1, :].clone()
+        y[:, :, 0, :] = a + b
+        y[:, :, 1, :] = a - b
+        y = y.view(-1, n)
+        h *= 2
+    return y.mul_(n ** -0.5)
+
+def hadamard_signs(name: str, cols: int) -> Tensor:
+    seed_bytes = hashlib.sha256(f"{name}:{cols}".encode("utf-8")).digest()[:8]
+    seed = int.from_bytes(seed_bytes, "little", signed=False)
+    rng = np.random.default_rng(seed)
+    signs = rng.choice(np.array((-1.0, 1.0), dtype=np.float32), size=cols)
+    return torch.from_numpy(signs).view(1, cols)
+
+def should_quantize_rotated_int8(name: str, t: Tensor) -> bool:
+    return t.ndim == 2 and matches_name_patterns(name, INT8_ROTATE_NAME_PATTERNS)
+
+def lowbit_qmax(bits: int) -> int:
+    if bits <= 1 or bits >= 8:
+        raise ValueError(f"Unsupported low-bit width: {bits}")
+    return (1 << (bits - 1)) - 1
+
+def reshape_lowbit_groups(t: Tensor, configured_group_size: int, label: str) -> tuple[Tensor, int]:
+    if t.ndim != 2:
+        raise ValueError(f"{label} grouping only supports 2D tensors")
+    cols = t.shape[1]
+    group_size = cols if configured_group_size <= 0 else min(configured_group_size, cols)
+    groups = math.ceil(cols / group_size)
+    pad = groups * group_size - cols
+    if pad:
+        t = F.pad(t, (0, pad))
+    return t.view(t.shape[0], groups, group_size), cols
+
+def expand_lowbit_scales(scale: Tensor, ref: Tensor) -> Tensor:
+    if scale.ndim == 1:
+        return scale.float().view(ref.shape[0], 1)
+    group_size = math.ceil(ref.shape[1] / scale.shape[1])
+    return scale.float().repeat_interleave(group_size, dim=1)[:, : ref.shape[1]]
+
 def should_quantize_int4(name: str, t: Tensor) -> bool:
-    return t.ndim == 2 and any(pattern in name for pattern in INT4_NAME_PATTERNS)
+    return t.ndim == 2 and matches_name_patterns(name, INT4_NAME_PATTERNS)
+
+def should_quantize_int6(name: str, t: Tensor) -> bool:
+    return t.ndim == 2 and matches_name_patterns(name, INT6_NAME_PATTERNS)
+
+def quantization_bits_for_tensor(name: str, t: Tensor) -> int:
+    if t.ndim != 2:
+        return 0
+    use_int4 = should_quantize_int4(name, t)
+    use_int6 = should_quantize_int6(name, t)
+    if use_int4 and use_int6:
+        raise ValueError(f"Tensor {name} matched both INT4_NAME_PATTERNS and INT6_NAME_PATTERNS")
+    if use_int6:
+        return 6
+    if use_int4:
+        return 4
+    return 0
 
 def pack_int4_tensor(q: Tensor) -> Tensor:
     flat = q.reshape(-1).to(torch.int16)
@@ -362,37 +451,78 @@ def unpack_int4_tensor(packed: Tensor, numel: int) -> Tensor:
     vals = torch.where(vals >= 8, vals - 16, vals)
     return vals.to(torch.float32)
 
+def pack_int6_tensor(q: Tensor) -> Tensor:
+    flat = q.reshape(-1).to(torch.int16)
+    vals = (flat & 63).to(torch.uint8).cpu().numpy()
+    bit_shifts = np.arange(6, dtype=np.uint8)
+    bits = ((vals[:, None] >> bit_shifts) & 1).reshape(-1)
+    packed = np.packbits(bits, bitorder="little")
+    return torch.from_numpy(packed.copy()).contiguous()
+
+def unpack_int6_tensor(packed: Tensor, numel: int) -> Tensor:
+    bits = np.unpackbits(packed.reshape(-1).cpu().numpy(), bitorder="little")[: numel * 6]
+    if bits.size != numel * 6:
+        raise ValueError(f"Packed int6 tensor is too short for numel={numel}")
+    vals = bits.reshape(numel, 6).astype(np.int16, copy=False)
+    shifts = (1 << np.arange(6, dtype=np.int16))[None, :]
+    unsigned = (vals * shifts).sum(axis=1, dtype=np.int32)
+    signed = np.where(unsigned >= 32, unsigned - 64, unsigned).astype(np.float32, copy=False)
+    return torch.from_numpy(signed.copy())
+
 def reshape_int4_groups(t: Tensor) -> tuple[Tensor, int]:
-    if t.ndim != 2:
-        raise ValueError("int4 grouping only supports 2D tensors")
-    cols = t.shape[1]
-    group_size = cols if INT4_GROUP_SIZE <= 0 else min(INT4_GROUP_SIZE, cols)
-    groups = math.ceil(cols / group_size)
-    pad = groups * group_size - cols
-    if pad:
-        t = F.pad(t, (0, pad))
-    return t.view(t.shape[0], groups, group_size), cols
+    return reshape_lowbit_groups(t, INT4_GROUP_SIZE, "int4")
 
 def expand_int4_scales(scale: Tensor, ref: Tensor) -> Tensor:
-    if scale.ndim == 1:
-        return scale.float().view(ref.shape[0], 1)
-    group_size = math.ceil(ref.shape[1] / scale.shape[1])
-    return scale.float().repeat_interleave(group_size, dim=1)[:, : ref.shape[1]]
+    return expand_lowbit_scales(scale, ref)
 
-def fake_quantize_tensor_int4(t: Tensor) -> Tensor:
+def reshape_int6_groups(t: Tensor) -> tuple[Tensor, int]:
+    return reshape_lowbit_groups(t, INT6_GROUP_SIZE, "int6")
+
+def expand_int6_scales(scale: Tensor, ref: Tensor) -> Tensor:
+    return expand_lowbit_scales(scale, ref)
+
+def fake_quantize_tensor_lowbit(
+    t: Tensor,
+    *,
+    bits: int,
+    clip_q: float,
+    configured_group_size: int,
+    label: str,
+) -> Tensor:
     if t.ndim != 2:
         return t
     t32 = t.float()
-    grouped, cols = reshape_int4_groups(t32)
+    grouped, cols = reshape_lowbit_groups(t32, configured_group_size, label)
     clip_abs = (
-        torch.quantile(grouped.abs(), INT4_CLIP_Q, dim=2)
+        torch.quantile(grouped.abs(), clip_q, dim=2)
         if grouped.numel()
         else torch.empty(grouped.shape[:2], dtype=torch.float32, device=t32.device)
     )
     clipped = torch.maximum(torch.minimum(grouped, clip_abs[..., None]), -clip_abs[..., None])
-    scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
-    dq = (torch.clamp(torch.round(clipped / scale[..., None]), -7, 7) * scale[..., None]).reshape(t32.shape[0], -1)[:, :cols]
+    qmax = lowbit_qmax(bits)
+    scale = (clip_abs / qmax).clamp_min(1.0 / qmax)
+    dq = (
+        torch.clamp(torch.round(clipped / scale[..., None]), -qmax, qmax) * scale[..., None]
+    ).reshape(t32.shape[0], -1)[:, :cols]
     return (t32 + (dq - t32).detach()).to(dtype=t.dtype)
+
+def fake_quantize_tensor_int4(t: Tensor) -> Tensor:
+    return fake_quantize_tensor_lowbit(
+        t,
+        bits=4,
+        clip_q=INT4_CLIP_Q,
+        configured_group_size=INT4_GROUP_SIZE,
+        label="int4",
+    )
+
+def fake_quantize_tensor_int6(t: Tensor) -> Tensor:
+    return fake_quantize_tensor_lowbit(
+        t,
+        bits=6,
+        clip_q=INT6_CLIP_Q,
+        configured_group_size=INT6_GROUP_SIZE,
+        label="int6",
+    )
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
@@ -412,6 +542,26 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE)
 
+def quantize_float_tensor_rotated(name: str, t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim != 2:
+        raise ValueError("rotated int8 path only supports 2D tensors")
+    cols = t32.shape[1]
+    rotated_cols = next_power_of_two(cols)
+    if rotated_cols != cols:
+        t32 = F.pad(t32, (0, rotated_cols - cols))
+    signs = hadamard_signs(name, rotated_cols).to(dtype=t32.dtype)
+    rotated = fwht_last_dim(t32 * signs)
+    clip_abs = (
+        torch.quantile(rotated.abs(), INT8_CLIP_Q, dim=1)
+        if rotated.numel()
+        else torch.empty((rotated.shape[0],), dtype=torch.float32)
+    )
+    clipped = torch.maximum(torch.minimum(rotated, clip_abs[:, None]), -clip_abs[:, None])
+    scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+    q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+    return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
 def quantize_float_tensor_int4(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim != 2:
@@ -423,11 +573,30 @@ def quantize_float_tensor_int4(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(clipped / scale[..., None]), -7, 7).to(torch.int8).reshape(t32.shape[0], -1)[:, :cols].contiguous()
     return pack_int4_tensor(q), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
+def quantize_float_tensor_int6(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim != 2:
+        raise ValueError("int6 path only supports 2D tensors")
+    grouped, cols = reshape_int6_groups(t32)
+    clip_abs = (
+        torch.quantile(grouped.abs(), INT6_CLIP_Q, dim=2)
+        if grouped.numel()
+        else torch.empty(grouped.shape[:2], dtype=torch.float32)
+    )
+    clipped = torch.maximum(torch.minimum(grouped, clip_abs[..., None]), -clip_abs[..., None])
+    scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)
+    q = torch.clamp(torch.round(clipped / scale[..., None]), -31, 31).to(torch.int8).reshape(t32.shape[0], -1)[:, :cols].contiguous()
+    return pack_int6_tensor(q), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
+    quantized_rotated: dict[str, Tensor] = {}
+    scales_rotated: dict[str, Tensor] = {}
     quantized4: dict[str, Tensor] = {}
     scales4: dict[str, Tensor] = {}
+    quantized6: dict[str, Tensor] = {}
+    scales6: dict[str, Tensor] = {}
     passthrough: dict[str, Tensor] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
@@ -446,7 +615,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        if any(pattern in name for pattern in INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS):
+        if matches_name_patterns(name, INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS):
             kept = keep_float_tensor(name, t)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
@@ -459,7 +628,18 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        if should_quantize_int4(name, t):
+        lowbit_bits = quantization_bits_for_tensor(name, t)
+        if should_quantize_rotated_int8(name, t):
+            q, s = quantize_float_tensor_rotated(name, t)
+            quantized_rotated[name] = q
+            scales_rotated[name] = s
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        elif lowbit_bits == 6:
+            q, s = quantize_float_tensor_int6(t)
+            quantized6[name] = q
+            scales6[name] = s
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        elif lowbit_bits == 4:
             q, s = quantize_float_tensor_int4(t)
             quantized4[name] = q
             scales4[name] = s
@@ -470,7 +650,17 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             scales[name] = s
             stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
-    return {"q": quantized, "s": scales, "q4": quantized4, "s4": scales4, "p": passthrough}, stats
+    return {
+        "q": quantized,
+        "s": scales,
+        "qr": quantized_rotated,
+        "sr": scales_rotated,
+        "q4": quantized4,
+        "s4": scales4,
+        "q6": quantized6,
+        "s6": scales6,
+        "p": passthrough,
+    }, stats
 
 def dequantize_state_dict_int8(obj: dict[str, object], template_state: dict[str, Tensor]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -481,11 +671,23 @@ def dequantize_state_dict_int8(obj: dict[str, object], template_state: dict[str,
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=ref.dtype).contiguous()
         else:
             out[name] = (q.float() * float(s.item())).to(dtype=ref.dtype).contiguous()
+    for name, q in obj.get("qr", {}).items():
+        ref = template_state[name]
+        s = obj["sr"][name]
+        rotated = q.float() * s.float().view(q.shape[0], 1)
+        signs = hadamard_signs(name, rotated.shape[1]).to(dtype=rotated.dtype)
+        restored = fwht_last_dim(rotated) * signs
+        out[name] = restored[:, : ref.shape[1]].to(dtype=ref.dtype).contiguous()
     for name, q in obj.get("q4", {}).items():
         ref = template_state[name]
         s = obj["s4"][name]
         flat = unpack_int4_tensor(q, ref.numel()).view_as(ref)
         out[name] = (flat * expand_int4_scales(s, ref)).to(dtype=ref.dtype).contiguous()
+    for name, q in obj.get("q6", {}).items():
+        ref = template_state[name]
+        s = obj["s6"][name]
+        flat = unpack_int6_tensor(q, ref.numel()).view_as(ref)
+        out[name] = (flat * expand_int6_scales(s, ref)).to(dtype=ref.dtype).contiguous()
     for name, t in obj["p"].items():
         ref = template_state[name]
         out[name] = t.detach().to("cpu").to(dtype=ref.dtype).contiguous()
@@ -565,7 +767,13 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        weight = fake_quantize_tensor_int4(self.weight) if self.training and getattr(self, "_qat_int4", False) else self.weight
+        qat_lowbit_bits = int(getattr(self, "_qat_lowbit_bits", 0))
+        if self.training and qat_lowbit_bits == 4:
+            weight = fake_quantize_tensor_int4(self.weight)
+        elif self.training and qat_lowbit_bits == 6:
+            weight = fake_quantize_tensor_int6(self.weight)
+        else:
+            weight = self.weight
         return F.linear(x, weight.to(x.dtype), bias)
 
 
@@ -658,14 +866,17 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        attn_kwargs = {"attn_mask": None, "is_causal": True}
+        if self.num_kv_heads != self.num_heads:
+            if SDP_ATTENTION_SUPPORTS_GQA:
+                attn_kwargs["enable_gqa"] = True
+            else:
+                if self.num_heads % self.num_kv_heads != 0:
+                    raise ValueError("num_heads must be divisible by num_kv_heads for GQA fallback")
+                repeats = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeats, dim=1)
+                v = v.repeat_interleave(repeats, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, **attn_kwargs)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -921,14 +1132,23 @@ def main() -> None:
         init_state = torch.load(args.init_model_path, map_location="cpu")
         base_model.load_state_dict(init_state, strict=True)
     qat_module_count = 0
+    qat_module_count_int4 = 0
+    qat_module_count_int6 = 0
     for module_name, module in base_model.named_modules():
         if isinstance(module, CastedLinear):
-            use_qat = args.qat_int4 and any(pattern in f"{module_name}.weight" for pattern in INT4_NAME_PATTERNS)
-            module._qat_int4 = use_qat
-            qat_module_count += int(use_qat)
+            weight_name = f"{module_name}.weight"
+            use_qat_int4 = args.qat_int4 and matches_name_patterns(weight_name, INT4_NAME_PATTERNS)
+            use_qat_int6 = args.qat_int6 and matches_name_patterns(weight_name, INT6_NAME_PATTERNS)
+            if use_qat_int4 and use_qat_int6:
+                raise ValueError(f"Module {weight_name} matched both QAT int4 and QAT int6 target sets")
+            qat_bits = 6 if use_qat_int6 else 4 if use_qat_int4 else 0
+            module._qat_lowbit_bits = qat_bits
+            qat_module_count += int(qat_bits > 0)
+            qat_module_count_int4 += int(qat_bits == 4)
+            qat_module_count_int6 += int(qat_bits == 6)
     if args.qat_only_target_params:
         for name, param in base_model.named_parameters():
-            param.requires_grad_(any(pattern in name for pattern in INT4_NAME_PATTERNS))
+            param.requires_grad_(matches_name_patterns(name, INT4_NAME_PATTERNS) or matches_name_patterns(name, INT6_NAME_PATTERNS))
     compiled_model = base_model if args.disable_model_compile else torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1014,9 +1234,16 @@ def main() -> None:
         log0(f"init_model_path:{args.init_model_path}")
     if INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS:
         log0(f"int8_keep_float_large_name_patterns:{INT8_KEEP_FLOAT_LARGE_NAME_PATTERNS}")
-    log0(f"qat_int4:{args.qat_int4} qat_modules:{qat_module_count}")
+    if INT8_ROTATE_NAME_PATTERNS:
+        log0(f"int8_rotate_name_patterns:{INT8_ROTATE_NAME_PATTERNS}")
+    log0(
+        f"qat_int4:{args.qat_int4} qat_int6:{args.qat_int6} "
+        f"qat_modules:{qat_module_count} qat_modules_int4:{qat_module_count_int4} "
+        f"qat_modules_int6:{qat_module_count_int6}"
+    )
     log0(f"qat_only_target_params:{args.qat_only_target_params}")
     log0(f"int4_group_size:{INT4_GROUP_SIZE if INT4_GROUP_SIZE > 0 else 'row'} int4_clip_percentile:{INT4_CLIP_PERCENTILE}")
+    log0(f"int6_group_size:{INT6_GROUP_SIZE if INT6_GROUP_SIZE > 0 else 'row'} int6_clip_percentile:{INT6_CLIP_PERCENTILE}")
     log0(
         f"model_compressor:{args.model_compressor} model_compress_preset:{args.model_compress_preset} "
         f"quant_pickle_protocol:{args.quant_pickle_protocol} "

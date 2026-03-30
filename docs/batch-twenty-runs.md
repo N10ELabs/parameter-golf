@@ -37,16 +37,17 @@ That is the missing tool if we want to:
 - maybe keep one late `c_k` in FP16 too
 - still stay legal without destroying the rest of the checkpoint
 
-## Required Implementation
+## Code Prerequisites
 
-Batch 20 assumes a small exporter extension in
+The needed exporter hooks now exist in
 [train_gpt.py](/Users/anthonymarti/Desktop/N10E%20LABS%20Code/parameter-golf/train_gpt.py):
 
-1. add `INT6_NAME_PATTERNS`
-2. add `INT6_GROUP_SIZE`
-3. add `INT6_CLIP_PERCENTILE`
-4. add packed `int6` save/load support parallel to the current `int4` path
-5. keep the artifact format self-contained and backwards-compatible for dense
+1. `INT6_NAME_PATTERNS`
+2. `INT6_GROUP_SIZE`
+3. `INT6_CLIP_PERCENTILE`
+4. packed `int6` save/load support parallel to the current `int4` path
+5. `QAT_INT6` for future low-bit adaptation work if it becomes necessary
+6. the artifact format remains self-contained and backwards-compatible for dense
    `int8` users
 
 This batch should stay export-only first.
