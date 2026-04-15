@@ -1,5 +1,10 @@
 <img width="3840" height="1280" alt="1920x640-discord" src="https://github.com/user-attachments/assets/90607b26-171f-476a-90ae-69b9dbb7cb30" />
 
+> Local fork note: the current project strategy is consolidated in
+> [docs/ROADMAP.md](docs/ROADMAP.md). The upstream leaderboard snapshot below is
+> retained from the original repository state and may not reflect the latest
+> official OpenAI leaderboard.
+
 <br>
 <br>
 
