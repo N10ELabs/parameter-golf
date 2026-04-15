@@ -562,6 +562,42 @@ Interpretation:
 - The main value of this run is operational: it confirms the current recipe,
   artifact size, and full-validation loop are stable on the live pod.
 
+Export sweep from the `38`-shard checkpoint:
+
+| Run | Matrix clip | GPTQ calibration batches | Total bytes | Quantized BPB | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `apr05_38shards_export_k12p85_cal8` | `12.850` | `8` | `16,001,261` | `1.26375852` | over cap |
+| `apr05_38shards_export_k12p852_cal8` | `12.852` | `8` | `16,000,139` | `1.26376026` | over cap |
+| `apr05_38shards_export_k12p853_cal8` | `12.853` | `8` | `15,999,590` | `1.26376547` | legal |
+| `apr05_38shards_export_k12p854_cal8` | `12.854` | `8` | `15,999,743` | `1.26376420` | legal |
+| `apr05_38shards_export_k12p855_cal8` | `12.855` | `8` | `15,999,298` | `1.26375981` | legal, best |
+| `apr05_38shards_export_k12p856_cal8` | `12.856` | `8` | `15,998,332` | `1.26376272` | legal |
+| `apr05_38shards_export_k12p858_cal8` | `12.858` | `8` | `15,997,308` | `1.26376813` | legal |
+| `apr05_38shards_export_k12p86_cal8` | `12.860` | `8` | `15,996,777` | `1.26377308` | legal |
+
+GPTQ calibration sweep at the best clip:
+
+| Run | Matrix clip | GPTQ calibration batches | Total bytes | Quantized BPB | Status |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `apr05_38shards_export_k12p855_cal8` | `12.855` | `8` | `15,999,298` | `1.26375981` | best |
+| `apr05_38shards_export_k12p855_cal16` | `12.855` | `16` | `15,998,168` | `1.26379644` | worse |
+| `apr05_38shards_export_k12p855_cal32` | `12.855` | `32` | `15,998,731` | `1.26379855` | worse |
+| `apr05_38shards_export_k12p855_cal64` | `12.855` | `64` | `15,999,249` | `1.26379062` | worse |
+| `apr05_38shards_export_k12p860_cal64` | `12.860` | `64` | `15,996,487` | `1.26381171` | worse |
+
+Interpretation:
+
+- The best current legal single-H100 artifact is
+  `apr05_38shards_export_k12p855_cal8`: `15,999,298` bytes and
+  `1.26375981` full-validation quantized BPB.
+- The legal clip boundary is around `12.853`; `12.852` was only `139` bytes
+  over cap.
+- More GPTQ calibration batches did not help this checkpoint. For this
+  shortened run, keep `GPTQ_CALIBRATION_BATCHES=8` unless a later checkpoint
+  shows different behavior.
+- This is a small but useful exporter improvement over the first legal
+  `MATRIX_CLIP_SIGMAS=13.0` run, which scored `1.26396070`.
+
 Near-term decision:
 
 - Keep using the single H100 for short ablations around EMA, clip sigma, GPTQ
